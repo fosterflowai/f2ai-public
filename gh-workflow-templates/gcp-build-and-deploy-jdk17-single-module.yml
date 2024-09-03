@@ -1,0 +1,99 @@
+name: Build & Deploy GCP
+
+on:
+  workflow_call:
+    secrets:
+      GCP_CREDENTIALS:
+        required: true
+    inputs:
+      GCR:
+        required: true
+        type: string
+      PROJECT_ID:
+        required: true
+        type: string
+      GKE_NAME:
+        required: true
+        type: string
+      GKE_LOCATION:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ENV:
+        required: false
+        type: string
+        default: 'dev'
+      MVN_ARGS:
+        required: false
+        type: string
+        default: ''
+
+jobs:
+
+  build-push-gcr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: checkout
+      uses: actions/checkout@master
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v2
+      with:
+        java-version: "17"
+        distribution: "adopt"
+
+    - name: Run mvn clean install
+      run: mvn -U -s mvn-settings.xml clean install -DskipTests -ntp ${{ inputs.MVN_ARGS }}
+
+    - name: Login to GCR
+      uses: docker/login-action@v1
+      with:
+        registry: ${{ inputs.GCR }}
+        username:  _json_key
+        password: ${{ secrets.GCP_CREDENTIALS }}
+
+    - name: Build and Push
+      id: build-and-push
+      uses: docker/build-push-action@v2
+      with:
+        context: .
+        builder: ${{ steps.buildx.outputs.name }}
+        push: true
+        tags: |
+          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}:${{ inputs.ENV }}-${{ github.sha }}
+          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}:latest
+
+  deploy-to-gcp:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build-push-gcr]
+    steps:
+    - name: checkout
+      uses: actions/checkout@master
+
+    - id: 'auth'
+      name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+    - name: get gke credentials
+      id: 'get-credentials'
+      uses: 'google-github-actions/get-gke-credentials@v2'
+      with:
+        cluster_name: ${{ inputs.GKE_NAME }}
+        location: ${{ inputs.GKE_LOCATION }}
+        project_id: ${{ inputs.PROJECT_ID }}
+
+    - name: Deploy to K8S
+      uses: azure/k8s-deploy@v1
+      with:
+        manifests: |
+          ${{ github.workspace }}/manifests/manifests-${{ inputs.ENV }}.yaml
+        images: |
+          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}:${{ inputs.ENV }}-${{ github.sha }}
+        namespace: ${{ inputs.NAMESPACE }}
