@@ -33,9 +33,12 @@ on:
         required: false
         type: string
         default: ${{ github.repository }}
+      JAVA_VERSION:
+        required: false
+        type: string
+        default: '17'
 
 jobs:
-
   build-push-gcr:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -43,10 +46,10 @@ jobs:
     - name: checkout
       uses: actions/checkout@master
 
-    - name: Set up JDK 17
+    - name: Set up JDK ${{ inputs.JAVA_VERSION }}
       uses: actions/setup-java@v2
       with:
-        java-version: "17"
+        java-version: ${{ inputs.JAVA_VERSION }}
         distribution: "adopt"
 
     - name: Run mvn clean install
