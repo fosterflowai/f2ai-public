@@ -28,6 +28,10 @@ on:
         required: false
         type: string
         default: 'dev'
+      MODEL_URL:
+        required: false
+        type: string
+        default: 'https://storage.googleapis.com/ff_algo/prod/java_models/online_models.tar'
       # MANIFESTS:
       #   required: false
       #   type: string
