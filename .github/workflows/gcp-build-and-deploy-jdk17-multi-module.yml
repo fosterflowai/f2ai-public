@@ -71,6 +71,8 @@ jobs:
       with:
         context: ./${{ inputs.MODULE }}
         builder: ${{ steps.buildx.outputs.name }}
+        build-args: |
+          MODEL_URL=${{ inputs.MODEL_URL }}
         push: true
         tags: |
           ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:${{ inputs.ENV }}-${{ github.sha }}
