@@ -36,6 +36,9 @@ on:
         required: false
         type: string
         default: ''
+      DOCKERFILE:
+        required: true
+        type: string
 
 jobs:
 
