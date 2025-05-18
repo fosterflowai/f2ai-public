@@ -69,6 +69,7 @@ jobs:
         context: ./${{ inputs.MODULE }}
         builder: ${{ steps.buildx.outputs.name }}
         push: true
+        file: ${{ inputs.DOCKERFILE }}
         tags: |
           ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:${{ inputs.ENV }}-${{ github.sha }}
           ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:latest
