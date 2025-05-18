@@ -76,8 +76,6 @@ jobs:
         tags: |
           ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:${{ inputs.ENV }}-${{ github.sha }}
           ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:latest
-        build-args: |
-          MODEL_URL=${{ inputs.MODEL_URL }}
   deploy-to-gcp:
     name: Deploy to GKE
     runs-on: ubuntu-latest
