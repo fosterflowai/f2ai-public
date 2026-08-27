@@ -45,6 +45,9 @@ jobs:
   build-push-gcr:
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: read
     steps:
     - name: checkout
       uses: actions/checkout@master
@@ -56,6 +59,11 @@ jobs:
         distribution: "adopt"
 
     - name: Run mvn clean install
+      env:
+        GITHUB_ACTOR: ${{ github.actor }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+        GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: mvn -U -s mvn-settings.xml clean install -DskipTests -ntp ${{ inputs.MVN_ARGS }}
 
     - name: Login to GCR
