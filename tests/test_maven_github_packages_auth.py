@@ -18,8 +18,12 @@ class MavenGithubPackagesAuthTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("packages: read", text, path.name)
             self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", text, path.name)
+            # The repo-scoped GITHUB_TOKEN cannot read another repo's packages
+            # (app-framework's f2ai-boms), so the org PAT wins when supplied
+            # and the Actions token remains the fallback.
             self.assertIn(
-                "GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+                "GITHUB_PACKAGES_TOKEN: "
+                "${{ secrets.PACKAGES_READ_PAT || secrets.GITHUB_TOKEN }}",
                 text,
                 path.name,
             )
@@ -29,6 +33,11 @@ class MavenGithubPackagesAuthTest(unittest.TestCase):
                 path.name,
             )
             self.assertIn("Run mvn clean install", text, path.name)
+
+    def test_reusable_workflows_declare_the_optional_packages_pat(self) -> None:
+        for path in WORKFLOWS:
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("PACKAGES_READ_PAT:", text, path.name)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,11 @@ on:
     secrets:
       GCP_CREDENTIALS:
         required: true
+      # Classic PAT with read:packages. The job's repo-scoped GITHUB_TOKEN
+      # cannot read packages published by sibling repos (app-framework's
+      # f2ai-boms), so cross-repo Maven resolution needs this org secret.
+      PACKAGES_READ_PAT:
+        required: false
     inputs:
       GCR:
         required: true
@@ -53,7 +58,7 @@ jobs:
         GITHUB_ACTOR: ${{ github.actor }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-        GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_PAT || secrets.GITHUB_TOKEN }}
       run: mvn -U -s mvn-settings.xml clean install -DskipTests -ntp ${{ inputs.MVN_ARGS }}
 
     - name: Login to GCR
