@@ -1,0 +1,55 @@
+name: GKE runtime-source rollout
+description: Bind a Deployment Pod template to exact Secret and ConfigMap metadata.
+
+inputs:
+  namespace:
+    description: Kubernetes namespace containing the workload and sources.
+    required: true
+  deployment:
+    description: Deployment name; the workload contract requires exactly two replicas.
+    required: true
+  service:
+    description: Service whose EndpointSlices and health endpoint are verified.
+    required: true
+  service-port:
+    description: Service port number or DNS label used by EndpointSlice and proxy checks.
+    required: true
+  health-path:
+    description: Absolute service health path, for example /health.
+    required: true
+  sources:
+    description: Newline-separated exact typed refs such as Secret/env-secrets.
+    required: true
+  check-only:
+    description: Fail on annotation drift without patching when true.
+    required: false
+    default: "false"
+  max-convergence-attempts:
+    description: Bounded attempts from one through three.
+    required: false
+    default: "3"
+
+runs:
+  using: composite
+  steps: # composite runner
+    - name: Reconcile runtime-source fingerprints
+      shell: bash
+      env:
+        INPUT_NAMESPACE: ${{ inputs.namespace }}
+        INPUT_DEPLOYMENT: ${{ inputs.deployment }}
+        INPUT_SERVICE: ${{ inputs.service }}
+        INPUT_SERVICE_PORT: ${{ inputs.service-port }}
+        INPUT_HEALTH_PATH: ${{ inputs.health-path }}
+        INPUT_SOURCES: ${{ inputs.sources }}
+        INPUT_CHECK_ONLY: ${{ inputs.check-only }}
+        INPUT_MAX_CONVERGENCE_ATTEMPTS: ${{ inputs.max-convergence-attempts }}
+      run: |
+        python3 "${{ github.action_path }}/runtime_source_rollout.py" \
+          --namespace "${INPUT_NAMESPACE}" \
+          --deployment "${INPUT_DEPLOYMENT}" \
+          --service "${INPUT_SERVICE}" \
+          --service-port "${INPUT_SERVICE_PORT}" \
+          --health-path "${INPUT_HEALTH_PATH}" \
+          --sources "${INPUT_SOURCES}" \
+          --check-only "${INPUT_CHECK_ONLY}" \
+          --max-convergence-attempts "${INPUT_MAX_CONVERGENCE_ATTEMPTS}"
