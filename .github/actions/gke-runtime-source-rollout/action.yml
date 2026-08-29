@@ -6,7 +6,7 @@ inputs:
     description: Kubernetes namespace containing the workload and sources.
     required: true
   deployment:
-    description: Deployment name; the workload contract requires exactly two replicas.
+    description: Deployment name; its replica count must match expected-replicas.
     required: true
   service:
     description: Service whose EndpointSlices and health endpoint are verified.
@@ -20,6 +20,10 @@ inputs:
   sources:
     description: Newline-separated exact typed refs such as Secret/env-secrets.
     required: true
+  expected-replicas:
+    description: Exact positive Deployment and ready Endpoint Pod count.
+    required: false
+    default: "2"
   check-only:
     description: Fail on annotation drift without patching when true.
     required: false
@@ -41,6 +45,7 @@ runs:
         INPUT_SERVICE_PORT: ${{ inputs.service-port }}
         INPUT_HEALTH_PATH: ${{ inputs.health-path }}
         INPUT_SOURCES: ${{ inputs.sources }}
+        INPUT_EXPECTED_REPLICAS: ${{ inputs.expected-replicas }}
         INPUT_CHECK_ONLY: ${{ inputs.check-only }}
         INPUT_MAX_CONVERGENCE_ATTEMPTS: ${{ inputs.max-convergence-attempts }}
       run: |
@@ -51,5 +56,6 @@ runs:
           --service-port "${INPUT_SERVICE_PORT}" \
           --health-path "${INPUT_HEALTH_PATH}" \
           --sources "${INPUT_SOURCES}" \
+          --expected-replicas "${INPUT_EXPECTED_REPLICAS}" \
           --check-only "${INPUT_CHECK_ONLY}" \
           --max-convergence-attempts "${INPUT_MAX_CONVERGENCE_ATTEMPTS}"

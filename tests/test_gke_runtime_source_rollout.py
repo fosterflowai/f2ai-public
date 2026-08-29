@@ -19,8 +19,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION_DIR = ROOT / ".github" / "actions" / "gke-runtime-source-rollout"
-IMPLEMENTATION = ACTION_DIR / "runtime_source_rollout.py"
-ACTION = ACTION_DIR / "action.yml"
+IMPLEMENTATION = Path(
+    os.environ.get(
+        "F2AI_RUNTIME_SOURCE_ROLLOUT_IMPLEMENTATION",
+        ACTION_DIR / "runtime_source_rollout.py",
+    )
+)
+ACTION = Path(
+    os.environ.get(
+        "F2AI_RUNTIME_SOURCE_ROLLOUT_ACTION",
+        ACTION_DIR / "action.yml",
+    )
+)
 SECRET_SENTINEL = "synthetic-secret-value-that-must-never-appear"
 
 
@@ -50,6 +60,10 @@ class FakeKubectl:
         self.ready_endpoints = 2
         self.health_output = SECRET_SENTINEL
         self.spec_replicas = 2
+        self.status_replicas = 2
+        self.status_updated_replicas = 2
+        self.status_ready_replicas = 2
+        self.status_available_replicas = 2
         self.max_unavailable = 0
         self.max_surge = 1
         self.endpoint_port = 80
@@ -168,10 +182,10 @@ class FakeKubectl:
                 },
                 "status": {
                     "observedGeneration": 9,
-                    "replicas": 2,
-                    "updatedReplicas": 2,
-                    "readyReplicas": 2,
-                    "availableReplicas": 2,
+                    "replicas": self.status_replicas,
+                    "updatedReplicas": self.status_updated_replicas,
+                    "readyReplicas": self.status_ready_replicas,
+                    "availableReplicas": self.status_available_replicas,
                 },
             }
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
@@ -393,7 +407,15 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
             },
         )
 
-    def run_rollout(self, fake, *, check_only=False, namespace="app", sources=None):
+    def run_rollout(
+        self,
+        fake,
+        *,
+        check_only=False,
+        namespace="app",
+        sources=None,
+        expected_replicas=2,
+    ):
         arguments = dict(
             namespace=namespace,
             deployment="f2ai-account",
@@ -405,6 +427,8 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
             max_convergence_attempts=3,
             runner=fake,
         )
+        if "expected_replicas" in inspect.signature(self.subject.reconcile).parameters:
+            arguments["expected_replicas"] = expected_replicas
         if "source_reader" in inspect.signature(self.subject.reconcile).parameters:
             arguments["source_reader"] = fake.read_source
         return self.subject.reconcile(**arguments)
@@ -570,6 +594,60 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
                     self.run_rollout(fake)
                 self.assertEqual([], fake.patches)
 
+    def test_one_replica_contract_validates_spec_status_and_one_ready_backend(self):
+        if "expected_replicas" not in inspect.signature(self.subject.reconcile).parameters:
+            self.fail("runtime-source rollout API is missing expected_replicas")
+        value_snapshot = snapshot()
+        fake = FakeKubectl(
+            [value_snapshot, value_snapshot],
+            deployment_annotations=self.current_annotations(value_snapshot),
+        )
+        fake.spec_replicas = 1
+        fake.status_replicas = 1
+        fake.status_updated_replicas = 1
+        fake.status_ready_replicas = 1
+        fake.status_available_replicas = 1
+        fake.ready_endpoints = 1
+
+        result = self.run_rollout(fake, expected_replicas=1)
+
+        self.assertFalse(result.changed)
+        self.assertEqual(1, fake.rollouts)
+
+    def test_each_status_count_must_equal_expected_replicas(self):
+        for attribute in (
+            "status_replicas",
+            "status_updated_replicas",
+            "status_ready_replicas",
+            "status_available_replicas",
+        ):
+            with self.subTest(attribute=attribute):
+                value_snapshot = snapshot()
+                fake = FakeKubectl(
+                    [value_snapshot, value_snapshot],
+                    deployment_annotations=self.current_annotations(value_snapshot),
+                )
+                setattr(fake, attribute, 1)
+
+                with self.assertRaisesRegex(
+                    self.subject.ReconcileError, "fully ready"
+                ):
+                    self.run_rollout(fake, expected_replicas=2)
+
+    def test_expected_replicas_must_be_a_positive_non_bool_integer(self):
+        if "expected_replicas" not in inspect.signature(self.subject.reconcile).parameters:
+            self.fail("runtime-source rollout API is missing expected_replicas validation")
+        for invalid in (0, -1, True, False, 1.0, "1", None):
+            with self.subTest(expected_replicas=invalid):
+                fake = FakeKubectl([snapshot()])
+
+                with self.assertRaisesRegex(
+                    self.subject.ValidationError, "expected-replicas"
+                ):
+                    self.run_rollout(fake, expected_replicas=invalid)
+
+                self.assertEqual([], fake.commands)
+
     def test_endpoint_contract_requires_exactly_two_ready_nonterminating_backends(self):
         value_snapshot = snapshot()
         fake = FakeKubectl(
@@ -616,6 +694,8 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
                 max_convergence_attempts=3,
                 runner=one_dual_stack_backend,
             )
+        if "expected_replicas" in inspect.signature(self.subject.reconcile).parameters:
+            arguments["expected_replicas"] = 2
         if "source_reader" in inspect.signature(self.subject.reconcile).parameters:
             arguments["source_reader"] = fake.read_source
         with self.assertRaisesRegex(self.subject.ReconcileError, "ready endpoints"):
@@ -708,6 +788,8 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
                     "max_convergence_attempts": 3,
                     "runner": fake,
                 }
+                if "expected_replicas" in inspect.signature(self.subject.reconcile).parameters:
+                    arguments["expected_replicas"] = 2
                 if "source_reader" in inspect.signature(self.subject.reconcile).parameters:
                     arguments["source_reader"] = fake.read_source
                 arguments.update(override)
@@ -744,6 +826,7 @@ class CompositeActionContractTest(unittest.TestCase):
             "service-port",
             "health-path",
             "sources",
+            "expected-replicas",
             "check-only",
             "max-convergence-attempts",
         }
@@ -759,6 +842,45 @@ class CompositeActionContractTest(unittest.TestCase):
             self.assertIn(f"${{{{ inputs.{name} }}}}", text)
         run_block = text.split("run: |", 1)[1]
         self.assertNotIn("${{ inputs.", run_block)
+        expected_replicas_block = text.split("  expected-replicas:", 1)[1].split(
+            "\n  check-only:", 1
+        )[0]
+        self.assertIn('default: "2"', expected_replicas_block)
+
+
+class CommandLineContractTest(unittest.TestCase):
+    def test_cli_passes_expected_replicas_to_the_python_api(self):
+        subject = load_subject()
+        if "expected_replicas" not in inspect.signature(subject.reconcile).parameters:
+            self.fail("runtime-source rollout CLI is missing expected_replicas")
+        expected_result = subject.ReconcileResult(changed=False, attempts=1)
+        argv = [
+            "--namespace",
+            "app",
+            "--deployment",
+            "f2ai-udp",
+            "--service",
+            "f2ai-udp",
+            "--service-port",
+            "80",
+            "--health-path",
+            "/health",
+            "--sources",
+            "Secret/env-secrets",
+            "--expected-replicas",
+            "1",
+            "--check-only",
+            "true",
+            "--max-convergence-attempts",
+            "1",
+        ]
+
+        with mock.patch.object(
+            subject, "reconcile", return_value=expected_result
+        ) as reconcile:
+            self.assertEqual(0, subject.main(argv))
+
+        self.assertEqual(1, reconcile.call_args.kwargs["expected_replicas"])
 
 
 if __name__ == "__main__":

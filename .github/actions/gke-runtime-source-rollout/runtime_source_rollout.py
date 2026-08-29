@@ -106,6 +106,12 @@ def _validate_health_path(value: str) -> str:
     return value
 
 
+def _validate_expected_replicas(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValidationError("invalid expected-replicas")
+    return value
+
+
 def parse_sources(value: str) -> tuple[SourceRef, ...]:
     if not isinstance(value, str):
         raise ValidationError("invalid sources")
@@ -414,12 +420,12 @@ def _int_or_string_equals(value: object, expected: int) -> bool:
     return value == expected or value == str(expected)
 
 
-def _validate_deployment_contract(deployment: dict) -> None:
+def _validate_deployment_contract(deployment: dict, expected_replicas: int) -> None:
     spec = deployment.get("spec") or {}
     strategy = spec.get("strategy") or {}
     rolling = strategy.get("rollingUpdate") or {}
     if (
-        spec.get("replicas") != 2
+        spec.get("replicas") != expected_replicas
         or strategy.get("type") != "RollingUpdate"
         or not _int_or_string_equals(rolling.get("maxUnavailable"), 0)
         or not _int_or_string_equals(rolling.get("maxSurge"), 1)
@@ -427,15 +433,15 @@ def _validate_deployment_contract(deployment: dict) -> None:
         raise ReconcileError("deployment contract is unsafe")
 
 
-def _validate_deployment_status(deployment: dict) -> None:
+def _validate_deployment_status(deployment: dict, expected_replicas: int) -> None:
     metadata = deployment.get("metadata") or {}
     status = deployment.get("status") or {}
     if (
         status.get("observedGeneration") != metadata.get("generation")
-        or status.get("replicas") != 2
-        or status.get("updatedReplicas") != 2
-        or status.get("readyReplicas") != 2
-        or status.get("availableReplicas") != 2
+        or status.get("replicas") != expected_replicas
+        or status.get("updatedReplicas") != expected_replicas
+        or status.get("readyReplicas") != expected_replicas
+        or status.get("availableReplicas") != expected_replicas
     ):
         raise ReconcileError("deployment rollout is not fully ready")
 
@@ -540,6 +546,7 @@ def _validate_endpoints(
     namespace: str,
     service_name: str,
     deployment: dict,
+    expected_replicas: int,
 ) -> None:
     service = _read_service(runner, namespace, service_name)
     _validate_service_selector(deployment, service)
@@ -578,8 +585,8 @@ def _validate_endpoints(
                 and target.get("namespace") == namespace
             ):
                 ready_pod_uids.add(uid)
-    if len(ready_pod_uids) != 2:
-        raise ReconcileError("service must have exactly two ready endpoints")
+    if len(ready_pod_uids) != expected_replicas:
+        raise ReconcileError("service must have exactly the expected ready endpoints")
 
 
 def _validate_health(
@@ -609,14 +616,17 @@ def _validate_runtime(
     health_path: str,
     desired: dict[str, str],
     source_refs: Sequence[SourceRef],
+    expected_replicas: int,
 ) -> dict:
     deployment = _read_deployment(runner, namespace, deployment_name)
-    _validate_deployment_contract(deployment)
+    _validate_deployment_contract(deployment, expected_replicas)
     _validate_source_coverage(deployment, source_refs)
-    _validate_deployment_status(deployment)
+    _validate_deployment_status(deployment, expected_replicas)
     if _has_drift(_current_annotations(deployment), desired):
         raise ReconcileError("deployment source annotation drift remains")
-    _validate_endpoints(runner, namespace, service, deployment)
+    _validate_endpoints(
+        runner, namespace, service, deployment, expected_replicas
+    )
     _validate_health(runner, namespace, service, service_port, health_path)
     return deployment
 
@@ -631,6 +641,7 @@ def reconcile(
     sources: str,
     check_only: bool,
     max_convergence_attempts: int,
+    expected_replicas: int,
     runner: Runner = subprocess.run,
     source_reader: SourceReader | None = None,
 ) -> ReconcileResult:
@@ -640,6 +651,7 @@ def reconcile(
     service_port = _validate_service_port(service_port)
     health_path = _validate_health_path(health_path)
     source_refs = parse_sources(sources)
+    expected_replicas = _validate_expected_replicas(expected_replicas)
     if not isinstance(check_only, bool):
         raise ValidationError("invalid check-only")
     if (
@@ -661,6 +673,7 @@ def reconcile(
                 source_refs=source_refs,
                 check_only=check_only,
                 max_convergence_attempts=max_convergence_attempts,
+                expected_replicas=expected_replicas,
                 runner=runner,
                 source_reader=lambda source_namespace, source: _read_partial_metadata(
                     base_url, source_namespace, source
@@ -675,6 +688,7 @@ def reconcile(
         source_refs=source_refs,
         check_only=check_only,
         max_convergence_attempts=max_convergence_attempts,
+        expected_replicas=expected_replicas,
         runner=runner,
         source_reader=source_reader,
     )
@@ -690,6 +704,7 @@ def _reconcile_validated(
     source_refs: Sequence[SourceRef],
     check_only: bool,
     max_convergence_attempts: int,
+    expected_replicas: int,
     runner: Runner,
     source_reader: SourceReader,
 ) -> ReconcileResult:
@@ -699,7 +714,7 @@ def _reconcile_validated(
         before = _read_sources(source_reader, namespace, source_refs)
         desired = _desired_annotations(namespace, before)
         current_deployment = _read_deployment(runner, namespace, deployment)
-        _validate_deployment_contract(current_deployment)
+        _validate_deployment_contract(current_deployment, expected_replicas)
         _validate_source_coverage(current_deployment, source_refs)
         drift = _has_drift(_current_annotations(current_deployment), desired)
 
@@ -727,12 +742,13 @@ def _reconcile_validated(
             health_path,
             desired,
             source_refs,
+            expected_replicas,
         )
         after = _read_sources(source_reader, namespace, source_refs)
         final_deployment = _read_deployment(runner, namespace, deployment)
-        _validate_deployment_contract(final_deployment)
+        _validate_deployment_contract(final_deployment, expected_replicas)
         _validate_source_coverage(final_deployment, source_refs)
-        _validate_deployment_status(final_deployment)
+        _validate_deployment_status(final_deployment, expected_replicas)
         if _has_drift(_current_annotations(final_deployment), desired):
             continue
         validated_rv = (validated_deployment.get("metadata") or {}).get(
@@ -763,6 +779,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-port", required=True)
     parser.add_argument("--health-path", required=True)
     parser.add_argument("--sources", required=True)
+    parser.add_argument("--expected-replicas", required=True, type=int)
     parser.add_argument("--check-only", required=True, type=_parse_bool)
     parser.add_argument("--max-convergence-attempts", required=True, type=int)
     return parser
@@ -780,6 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sources=arguments.sources,
             check_only=arguments.check_only,
             max_convergence_attempts=arguments.max_convergence_attempts,
+            expected_replicas=arguments.expected_replicas,
         )
     except (ValidationError, ReconcileError) as error:
         print(f"runtime-source rollout failed: {error}", file=sys.stderr)
