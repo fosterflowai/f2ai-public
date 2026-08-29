@@ -21,7 +21,13 @@ class GkeEnvSecretsPreflightBashTest(unittest.TestCase):
         return textwrap.dedent(text.split(marker, 1)[1])
 
     def run_workflow(
-        self, namespace: str
+        self,
+        namespace: str,
+        *,
+        required_keys: str = "required.key",
+        required_named_keys: str = "",
+        named_secret_json: str = '{"data":{"STRIPE_WEBHOOK_SECRET":"named-sentinel"}}',
+        workload_identity_email: str = "preflight@example.invalid",
     ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
         with tempfile.TemporaryDirectory() as directory:
             temp_root = Path(directory)
@@ -35,6 +41,8 @@ class GkeEnvSecretsPreflightBashTest(unittest.TestCase):
                 "printf '%s\\n' '__CALL_END__' >> \"${KUBECTL_ARGV_LOG}\"\n"
                 "if [ \"${3:-}\" = 'serviceaccount' ]; then\n"
                 "  printf '%s' \"${FAKE_WI_EMAIL}\"\n"
+                "elif [ \"${4:-}\" = 'f2ai-account-stripe' ]; then\n"
+                "  printf '%s' \"${FAKE_NAMED_SECRET_JSON}\"\n"
                 "else\n"
                 "  printf '%s' "
                 "'{\"data\":{\"required.key\":\"cHJlc2VudA==\"}}'\n"
@@ -48,11 +56,13 @@ class GkeEnvSecretsPreflightBashTest(unittest.TestCase):
                     "PATH": f"{temp_root}{os.pathsep}{environment['PATH']}",
                     "KUBECTL_ARGV_LOG": str(invocation_log),
                     "NAMESPACE": namespace,
-                    "REQUIRED_KEYS": "required.key",
+                    "REQUIRED_KEYS": required_keys,
+                    "REQUIRED_NAMED_KEYS": required_named_keys,
                     "SHOPIFY_NONCE_MIN_BYTES": "0",
                     "GCP_SA_KEYS": "",
-                    "WI_EMAIL": "preflight@example.invalid",
-                    "FAKE_WI_EMAIL": "preflight@example.invalid",
+                    "WI_EMAIL": workload_identity_email,
+                    "FAKE_WI_EMAIL": workload_identity_email,
+                    "FAKE_NAMED_SECRET_JSON": named_secret_json,
                 }
             )
             completed = subprocess.run(
@@ -133,6 +143,59 @@ class GkeEnvSecretsPreflightBashTest(unittest.TestCase):
                     }
                 )
         self.assertEqual([], failures)
+
+    def test_named_secret_reference_uses_exact_argv_without_emitting_value(self) -> None:
+        sentinel = "NAMED_SECRET_VALUE_MUST_NOT_BE_EMITTED"
+        completed, calls = self.run_workflow(
+            "app",
+            required_keys="",
+            required_named_keys="f2ai-account-stripe/STRIPE_WEBHOOK_SECRET",
+            named_secret_json=(
+                '{"data":{"STRIPE_WEBHOOK_SECRET":"' + sentinel + '"}}'
+            ),
+            workload_identity_email="",
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("", completed.stdout)
+        self.assertNotIn(sentinel, completed.stderr)
+        self.assertEqual(
+            [
+                [
+                    "--namespace=app",
+                    "get",
+                    "secret",
+                    "f2ai-account-stripe",
+                    "-o",
+                    "json",
+                ]
+            ],
+            calls,
+        )
+
+    def test_invalid_named_secret_reference_fails_before_kubectl(self) -> None:
+        for reference in ("-option/KEY", "valid/$(id)", "missing-slash"):
+            completed, calls = self.run_workflow(
+                "app",
+                required_keys="",
+                required_named_keys=reference,
+                workload_identity_email="",
+            )
+            self.assertNotEqual(0, completed.returncode, reference)
+            self.assertEqual([], calls, reference)
+
+    def test_missing_named_key_fails_without_emitting_other_values(self) -> None:
+        sentinel = "UNRELATED_SECRET_VALUE_MUST_NOT_BE_EMITTED"
+        completed, calls = self.run_workflow(
+            "app",
+            required_keys="",
+            required_named_keys="f2ai-account-stripe/STRIPE_WEBHOOK_SECRET",
+            named_secret_json='{"data":{"OTHER":"' + sentinel + '"}}',
+            workload_identity_email="",
+        )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertNotIn(sentinel, completed.stderr)
+        self.assertEqual(1, len(calls))
 
 
 if __name__ == "__main__":

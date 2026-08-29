@@ -52,6 +52,44 @@ class GkeEnvSecretsPreflightTest(unittest.TestCase):
         self.assertIsNotNone(match, "embedded JSON parser must remain executable")
         return textwrap.dedent(match.group("body"))
 
+    def embedded_named_secret_parser(self) -> str:
+        text = self.workflow_text()
+        self.assertIn("# NAMED_SECRET_JSON_PARSER_START", text)
+        self.assertIn("# NAMED_SECRET_JSON_PARSER_END", text)
+        block = text.split("# NAMED_SECRET_JSON_PARSER_START", 1)[1].split(
+            "# NAMED_SECRET_JSON_PARSER_END", 1
+        )[0]
+        match = re.search(
+            r"(?ms)python3 -c '\n(?P<body>.*?)^\s*' \"\$\{secret_name\}\" \"\$\{key\}\"",
+            block,
+        )
+        self.assertIsNotNone(match, "named-secret JSON parser must remain executable")
+        return textwrap.dedent(match.group("body"))
+
+    def run_embedded_named_secret_parser(
+        self, secret_name: str, key: str, document: object
+    ) -> tuple[int, str]:
+        source = self.embedded_named_secret_parser()
+        previous_argv = sys.argv
+        previous_stdin = sys.stdin
+        previous_stdout = sys.stdout
+        output = io.StringIO()
+        try:
+            sys.argv = ["embedded-named-secret-parser", secret_name, key]
+            sys.stdin = io.StringIO(json.dumps(document))
+            sys.stdout = output
+            try:
+                exec(compile(source, "<embedded-named-secret-parser>", "exec"), {})
+            except SystemExit as error:
+                status = error.code if isinstance(error.code, int) else 1
+            else:
+                status = 0
+        finally:
+            sys.argv = previous_argv
+            sys.stdin = previous_stdin
+            sys.stdout = previous_stdout
+        return status, output.getvalue()
+
     def run_embedded_secret_parser(self, key: str, document: object) -> tuple[int, str]:
         source = self.embedded_secret_parser()
         previous_argv = sys.argv
@@ -101,6 +139,45 @@ class GkeEnvSecretsPreflightTest(unittest.TestCase):
         self.assertIn("data.get(key)", parser)
         self.assertIn("1 <= len(key) <= 253", parser)
         self.assertIn("[A-Za-z0-9._-]{1,253}", parser)
+
+    def test_named_secret_input_checks_exact_secret_and_key_without_reading_values(self) -> None:
+        text = self.workflow_text()
+        parser = self.embedded_named_secret_parser()
+        self.assertIn("required_named_keys", text)
+        self.assertIn("REQUIRED_NAMED_KEYS", text)
+        self.assertIn('kubectl --namespace="${NAMESPACE}" get secret "${secret_name}" -o json', text)
+        self.assertIn("key not in data", parser)
+        self.assertNotIn("data.get", parser)
+        self.assertNotIn("sys.stdout.write", parser)
+        self.assertNotRegex(text, r"named_encoded|NAMED_.*VALUE")
+
+    def test_named_secret_parser_accepts_exact_metadata_reference_without_output(self) -> None:
+        sentinel = "SECRET_VALUE_MUST_NEVER_BE_READ_OR_PRINTED"
+        status, output = self.run_embedded_named_secret_parser(
+            "f2ai-account-stripe",
+            "STRIPE_WEBHOOK_SECRET",
+            {"data": {"STRIPE_WEBHOOK_SECRET": sentinel}},
+        )
+        self.assertEqual(0, status)
+        self.assertEqual("", output)
+        self.assertNotIn(sentinel, output)
+
+    def test_named_secret_parser_rejects_invalid_names_keys_and_missing_entries(self) -> None:
+        cases = (
+            ("-option", "KEY", {"data": {"KEY": "sentinel"}}),
+            ("UPPERCASE", "KEY", {"data": {"KEY": "sentinel"}}),
+            ("a..b", "KEY", {"data": {"KEY": "sentinel"}}),
+            ("valid-name", "key/child", {"data": {"key/child": "sentinel"}}),
+            ("valid-name", "$(id)", {"data": {"$(id)": "sentinel"}}),
+            ("valid-name", "MISSING", {"data": {"OTHER": "sentinel"}}),
+            ("valid-name", "KEY", {"data": []}),
+        )
+        for secret_name, key, document in cases:
+            status, output = self.run_embedded_named_secret_parser(
+                secret_name, key, document
+            )
+            self.assertNotEqual(0, status, (secret_name, key))
+            self.assertEqual("", output, (secret_name, key))
 
     def test_legal_kubernetes_secret_keys_are_exact_dictionary_lookups(self) -> None:
         encoded = "c3ludGhldGljLXZhbHVl"
