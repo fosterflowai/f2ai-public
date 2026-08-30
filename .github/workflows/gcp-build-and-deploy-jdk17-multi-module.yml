@@ -1,13 +1,17 @@
-name: Build & Deploy GCP
+name: Build, attest, scan, and deploy GCP multi-module service
 
 on:
   workflow_call:
+    outputs:
+      image_digest:
+        description: Immutable sha256 digest produced by BuildKit.
+        value: ${{ jobs.build-push-gcr.outputs.image_digest }}
+      image_ref:
+        description: Fully qualified repository@sha256 image reference.
+        value: ${{ jobs.build-push-gcr.outputs.image_ref }}
     secrets:
       GCP_CREDENTIALS:
         required: true
-      # Classic PAT with read:packages. The job's repo-scoped GITHUB_TOKEN
-      # cannot read packages published by sibling repos (app-framework's
-      # f2ai-boms), so cross-repo Maven resolution needs this org secret.
       PACKAGES_READ_PAT:
         required: false
     inputs:
@@ -32,92 +36,401 @@ on:
       ENV:
         required: false
         type: string
-        default: 'dev'
+        default: dev
       MODEL_URL:
         required: false
         type: string
-        default: 'https://storage.googleapis.com/ff_algo/prod/java_models/online_models.tar'
-      # MANIFESTS:
-      #   required: false
-      #   type: string
-      #   default: 'manifests.yaml'
+        default: https://storage.googleapis.com/ff_algo/prod/java_models/online_models.tar
       MVN_ARGS:
+        description: Deprecated. Any non-empty value fails closed; Maven arguments are fixed.
         required: false
         type: string
-        default: ''
-jobs:
+        default: ""
+      DEPLOYMENT:
+        description: Exact Deployment name. Empty derives the unique Deployment from the manifest.
+        required: false
+        type: string
+        default: ""
+      CONTAINER:
+        description: Exact container name. Empty derives the unique matching container.
+        required: false
+        type: string
+        default: ""
+      ROLLOUT_TIMEOUT_SECONDS:
+        required: false
+        type: number
+        default: 600
 
+jobs:
   build-push-gcr:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
       contents: read
       packages: read
+    outputs:
+      image_digest: ${{ steps.immutable.outputs.image_digest }}
+      image_ref: ${{ steps.immutable.outputs.image_ref }}
+      image_repository: ${{ steps.release-contract.outputs.image_repository }}
+      manifest_relative_path: ${{ steps.release-contract.outputs.manifest_relative_path }}
     steps:
-    - name: checkout
-      uses: actions/checkout@61b9e3751b92087fd0b06925ba6dd6314e06f089
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@215b7e5f829ab9cac114c149667e57dc1b70b4bc
-      with:
-        java-version: "17"
-        distribution: "adopt"
+      - name: Validate immutable release contract
+        id: release-contract
+        env:
+          REGISTRY: ${{ inputs.GCR }}
+          PROJECT_ID: ${{ inputs.PROJECT_ID }}
+          NAMESPACE: ${{ inputs.NAMESPACE }}
+          MODULE: ${{ inputs.MODULE }}
+          RELEASE_ENV: ${{ inputs.ENV }}
+          MODEL_URL: ${{ inputs.MODEL_URL }}
+          LEGACY_MVN_ARGS: ${{ inputs.MVN_ARGS }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import urlsplit
 
-    - name: Run mvn clean install
-      env:
-        GITHUB_ACTOR: ${{ github.actor }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-        GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_PAT || secrets.GITHUB_TOKEN }}
-      run: mvn -U -s mvn-settings.xml clean install -DskipTests -ntp ${{ inputs.MVN_ARGS }}
+          def fail(message: str) -> None:
+              raise SystemExit(message)
 
-    - name: Login to GCR
-      uses: docker/login-action@dd4fa0671be5250ee6f50aedf4cb05514abda2c7
-      with:
-        registry: ${{ inputs.GCR }}
-        username:  _json_key
-        password: ${{ secrets.GCP_CREDENTIALS }}
+          registry = os.environ["REGISTRY"]
+          project = os.environ["PROJECT_ID"]
+          namespace = os.environ["NAMESPACE"]
+          module = os.environ["MODULE"]
+          release_env = os.environ["RELEASE_ENV"]
+          source_repository = os.environ["SOURCE_REPOSITORY"]
+          source_sha = os.environ["SOURCE_SHA"]
+          model_url = os.environ["MODEL_URL"]
+          if os.environ["LEGACY_MVN_ARGS"].strip():
+              fail("free-form MVN_ARGS is not supported")
+          values = (registry, project, namespace, module, release_env, model_url)
+          if any(any(ord(char) < 32 or ord(char) == 127 for char in value) for value in values):
+              fail("release inputs contain control characters")
+          dns_label = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+          registry_pattern = rf"{dns_label}(?:\.{dns_label})+"
+          if re.fullmatch(registry_pattern, registry) is None:
+              fail("invalid registry host")
+          if re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project) is None:
+              fail("invalid GCP project ID")
+          if not 1 <= len(namespace) <= 63 or re.fullmatch(dns_label, namespace) is None:
+              fail("invalid Kubernetes namespace")
+          if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", release_env) is None:
+              fail("invalid release environment")
+          if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+              fail("source SHA is not a full commit")
+          if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", source_repository) is None:
+              fail("invalid source repository")
+          module_path = PurePosixPath(module)
+          if module.startswith("/") or not module_path.parts or any(
+              part in {"", ".", ".."} or re.fullmatch(r"[A-Za-z0-9._-]+", part) is None
+              for part in module_path.parts
+          ):
+              fail("invalid module path")
+          workspace = Path(os.environ["WORKSPACE"]).resolve()
+          build_context = (workspace / module).resolve()
+          try:
+              build_context.relative_to(workspace)
+          except ValueError:
+              fail("module path escapes the checkout")
+          if not build_context.is_dir():
+              fail("module path is not a directory")
+          parsed = urlsplit(model_url)
+          if (
+              parsed.scheme != "https"
+              or not parsed.hostname
+              or parsed.username is not None
+              or parsed.password is not None
+              or parsed.fragment
+          ):
+              fail("MODEL_URL must be an HTTPS URL without credentials or fragment")
+          image_repository = f"{registry}/{project}/{source_repository.lower()}/{module.lower()}"
+          image_tag = f"{release_env}-{source_sha}"
+          manifest_relative_path = f"{module}/manifests/manifests-{release_env}.yaml"
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"build_context={build_context}\n")
+              handle.write(f"image_repository={image_repository}\n")
+              handle.write(f"image_tag={image_tag}\n")
+              handle.write(f"manifest_relative_path={manifest_relative_path}\n")
+          PY
 
-    - name: Build and Push
-      id: build-and-push
-      uses: docker/build-push-action@ac9327eae2b366085ac7f6a2d02df8aa8ead720a
-      with:
-        context: ./${{ inputs.MODULE }}
-        builder: ${{ steps.buildx.outputs.name }}
-        build-args: |
-          MODEL_URL=${{ inputs.MODEL_URL }}
-        push: true
-        tags: |
-          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:${{ inputs.ENV }}-${{ github.sha }}
-          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:latest
+      - name: Set up JDK 17
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Run mvn clean install
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.PACKAGES_READ_PAT || secrets.GITHUB_TOKEN }}
+        run: mvn --batch-mode -U -s mvn-settings.xml clean install --no-transfer-progress
+
+      - name: Login to the exact registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ inputs.GCR }}
+          username: _json_key
+          password: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Build, push, attest, and publish SBOM
+        id: build-and-push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ steps.release-contract.outputs.build_context }}
+          build-args: |
+            MODEL_URL=${{ inputs.MODEL_URL }}
+          push: true
+          tags: ${{ steps.release-contract.outputs.image_repository }}:${{ steps.release-contract.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release-contract.outputs.image_tag }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Bind the immutable image digest
+        id: immutable
+        env:
+          IMAGE_DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ steps.release-contract.outputs.image_repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          digest = os.environ["IMAGE_DIGEST"]
+          repository = os.environ["IMAGE_REPOSITORY"]
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("BuildKit did not return one sha256 digest")
+          image_ref = f"{repository}@{digest}"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"image_digest={digest}\n")
+              handle.write(f"image_ref={image_ref}\n")
+          PY
+
+      - name: Fail closed on HIGH or CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          scan-type: image
+          image-ref: ${{ steps.immutable.outputs.image_ref }}
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: table
+          exit-code: '1'
+          timeout: 10m0s
+          cache: false
+
   deploy-to-gcp:
-    name: Deploy to GKE
+    name: Deploy immutable image to GKE
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 30
     needs: [build-push-gcr]
+    permissions:
+      contents: read
     steps:
-    - name: checkout
-      uses: actions/checkout@61b9e3751b92087fd0b06925ba6dd6314e06f089
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - id: 'auth'
-      name: 'Authenticate to Google Cloud'
-      uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed'
-      with:
-        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
-    - name: get gke credentials
-      id: 'get-credentials'
-      uses: 'google-github-actions/get-gke-credentials@64bc7249bbcf78056bb92f14d3cedc2da193946c'
-      with:
-        cluster_name: ${{ inputs.GKE_NAME }}
-        location: ${{ inputs.GKE_LOCATION }}
-        project_id: ${{ inputs.PROJECT_ID }}
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
+        with:
+          cluster_name: ${{ inputs.GKE_NAME }}
+          location: ${{ inputs.GKE_LOCATION }}
+          project_id: ${{ inputs.PROJECT_ID }}
 
-    - name: Deploy to K8S
-      uses: azure/k8s-deploy@2f25f49dce3a648e1451f23f89fd73a2e1085123
-      with:
-        manifests: |
-          ${{ github.workspace }}/${{ inputs.MODULE }}/manifests/manifests-${{ inputs.ENV }}.yaml
-        images: |
-          ${{ inputs.GCR }}/${{ inputs.PROJECT_ID }}/${{ github.repository }}/${{ inputs.MODULE }}:${{ inputs.ENV }}-${{ github.sha }}
-        namespace: ${{ inputs.NAMESPACE }}
+      - name: Validate deploy target and manifest
+        id: deploy-contract
+        env:
+          MANIFEST_RELATIVE_PATH: ${{ needs.build-push-gcr.outputs.manifest_relative_path }}
+          NAMESPACE: ${{ inputs.NAMESPACE }}
+          REQUESTED_DEPLOYMENT: ${{ inputs.DEPLOYMENT }}
+          REQUESTED_CONTAINER: ${{ inputs.CONTAINER }}
+          ROLLOUT_TIMEOUT_SECONDS: ${{ inputs.ROLLOUT_TIMEOUT_SECONDS }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import stat
+          from pathlib import Path
+
+          workspace = Path(os.environ["WORKSPACE"]).resolve()
+          candidate = workspace / os.environ["MANIFEST_RELATIVE_PATH"]
+          if candidate.is_symlink():
+              raise SystemExit("manifest must not be a symbolic link")
+          manifest = candidate.resolve()
+          try:
+              manifest.relative_to(workspace)
+          except ValueError:
+              raise SystemExit("manifest path escapes the checkout")
+          metadata = manifest.lstat()
+          if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4 * 1024 * 1024:
+              raise SystemExit("manifest must be a bounded regular file")
+          namespace = os.environ["NAMESPACE"]
+          dns_label = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+          if not 1 <= len(namespace) <= 63 or re.fullmatch(dns_label, namespace) is None:
+              raise SystemExit("invalid namespace")
+          resource_name = r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?"
+          for field in ("REQUESTED_DEPLOYMENT", "REQUESTED_CONTAINER"):
+              value = os.environ[field]
+              if value and (len(value) > 253 or re.fullmatch(resource_name, value) is None):
+                  raise SystemExit(f"invalid {field.lower()}")
+          try:
+              timeout = int(os.environ["ROLLOUT_TIMEOUT_SECONDS"])
+          except ValueError:
+              raise SystemExit("rollout timeout must be an integer")
+          if not 60 <= timeout <= 1800:
+              raise SystemExit("rollout timeout is outside the allowed range")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"manifest_path={manifest}\n")
+              handle.write(f"rollout_timeout={timeout}s\n")
+              handle.write(f"rollout_timeout_seconds={timeout}\n")
+          PY
+
+      - name: Apply manifest with the immutable image
+        uses: azure/k8s-deploy@51ca02a8b7225fbd0924aac359c5b336a5f1e5b4 # v7.0.0
+        with:
+          manifests: ${{ steps.deploy-contract.outputs.manifest_path }}
+          images: ${{ needs.build-push-gcr.outputs.image_ref }}
+          namespace: ${{ inputs.NAMESPACE }}
+          timeout: ${{ steps.deploy-contract.outputs.rollout_timeout }}
+          pull-images: false
+          annotate-resources: false
+
+      - name: Verify rollout, spec digest, pod imageID, and readback
+        env:
+          EXPECTED_IMAGE: ${{ needs.build-push-gcr.outputs.image_ref }}
+          MANIFEST_PATH: ${{ steps.deploy-contract.outputs.manifest_path }}
+          NAMESPACE: ${{ inputs.NAMESPACE }}
+          REQUESTED_DEPLOYMENT: ${{ inputs.DEPLOYMENT }}
+          REQUESTED_CONTAINER: ${{ inputs.CONTAINER }}
+          ROLLOUT_TIMEOUT_SECONDS: ${{ steps.deploy-contract.outputs.rollout_timeout_seconds }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          namespace = os.environ["NAMESPACE"]
+          manifest = os.environ["MANIFEST_PATH"]
+          expected_image = os.environ["EXPECTED_IMAGE"]
+          requested_deployment = os.environ["REQUESTED_DEPLOYMENT"]
+          requested_container = os.environ["REQUESTED_CONTAINER"]
+          timeout = int(os.environ["ROLLOUT_TIMEOUT_SECONDS"])
+          expected_digest = expected_image.rsplit("@", 1)[-1]
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+              raise SystemExit("expected image is not digest pinned")
+
+          def command(*arguments: str, timeout_seconds: int = 60) -> str:
+              completed = subprocess.run(
+                  ["kubectl", *arguments], check=False, capture_output=True,
+                  text=True, timeout=timeout_seconds,
+              )
+              if completed.returncode != 0:
+                  raise SystemExit(f"kubectl {arguments[0]} failed closed")
+              return completed.stdout
+
+          resources = json.loads(command("--namespace", namespace, "get", "-f", manifest, "-o", "json"))
+          items = resources.get("items", []) if resources.get("kind") == "List" else [resources]
+          deployment_names = sorted(
+              item.get("metadata", {}).get("name", "")
+              for item in items if item.get("kind") == "Deployment"
+          )
+          deployment_names = [name for name in deployment_names if name]
+          if requested_deployment:
+              if deployment_names.count(requested_deployment) != 1:
+                  raise SystemExit("requested Deployment is not uniquely owned by the manifest")
+              deployment_name = requested_deployment
+          elif len(deployment_names) == 1:
+              deployment_name = deployment_names[0]
+          else:
+              raise SystemExit("manifest must own a unique Deployment when DEPLOYMENT is empty")
+
+          deployment = json.loads(command("--namespace", namespace, "get", "deployment", deployment_name, "-o", "json"))
+          containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+          if requested_container:
+              matches = [row for row in containers if row.get("name") == requested_container]
+          else:
+              matches = [row for row in containers if row.get("image") == expected_image]
+              if not matches and len(containers) == 1:
+                  matches = containers
+          if len(matches) != 1:
+              raise SystemExit("Deployment must expose a unique matching container")
+          container_name = matches[0].get("name")
+
+          command("--namespace", namespace, "rollout", "status", f"deployment/{deployment_name}",
+                  f"--timeout={timeout}s", timeout_seconds=timeout + 30)
+          deployment = json.loads(command("--namespace", namespace, "get", "deployment", deployment_name, "-o", "json"))
+          metadata = deployment.get("metadata", {})
+          spec = deployment.get("spec", {})
+          status = deployment.get("status", {})
+          generation = metadata.get("generation")
+          observed = status.get("observedGeneration")
+          desired = spec.get("replicas", 1)
+          if not isinstance(desired, int) or isinstance(desired, bool) or desired < 0:
+              raise SystemExit("Deployment replicas must be a non-negative integer")
+          if not isinstance(generation, int) or not isinstance(observed, int) or observed < generation:
+              raise SystemExit("Deployment controller has not observed the current generation")
+          for field in ("updatedReplicas", "readyReplicas", "availableReplicas"):
+              if status.get(field, 0) != desired:
+                  raise SystemExit(f"Deployment {field} does not match desired replicas")
+          current = [row for row in spec.get("template", {}).get("spec", {}).get("containers", [])
+                     if row.get("name") == container_name]
+          if len(current) != 1 or current[0].get("image") != expected_image:
+              raise SystemExit("Deployment spec does not contain the expected immutable image")
+
+          selector = spec.get("selector", {})
+          labels = selector.get("matchLabels")
+          if not isinstance(labels, dict) or not labels or selector.get("matchExpressions"):
+              raise SystemExit("Deployment requires a bounded matchLabels-only pod selector")
+          pods = json.loads(command("--namespace", namespace, "get", "pods", "-o", "json")).get("items", [])
+          active = [pod for pod in pods
+                    if pod.get("metadata", {}).get("deletionTimestamp") is None
+                    and all(pod.get("metadata", {}).get("labels", {}).get(key) == value
+                            for key, value in labels.items())]
+          if len(active) != desired:
+              raise SystemExit("active pod count does not match desired replicas")
+          if desired == 0:
+              print("immutable deployment verified; zero replicas makes pod imageID readback not applicable")
+          for pod in active:
+              pod_spec = [row for row in pod.get("spec", {}).get("containers", [])
+                          if row.get("name") == container_name]
+              containerStatuses = [row for row in pod.get("status", {}).get("containerStatuses", [])
+                                   if row.get("name") == container_name]
+              if len(pod_spec) != 1 or pod_spec[0].get("image") != expected_image:
+                  raise SystemExit("pod spec image readback differs from the immutable image")
+              if len(containerStatuses) != 1 or containerStatuses[0].get("ready") is not True:
+                  raise SystemExit("pod container is not uniquely ready")
+              imageID = containerStatuses[0].get("imageID", "")
+              if not isinstance(imageID, str) or not imageID.endswith(expected_digest):
+                  raise SystemExit("pod imageID does not resolve to the expected digest")
+          print(f"verified deployment/{deployment_name} container/{container_name} at {expected_digest}")
+          PY
