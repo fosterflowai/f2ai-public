@@ -64,8 +64,10 @@ class FakeKubectl:
         self.status_ready_replicas = 2
         self.status_available_replicas = 2
         self.deployment_status_sequence: list[dict[str, int]] = []
+        self.strategy_type = "RollingUpdate"
         self.max_unavailable = 0
         self.max_surge = 1
+        self.include_rolling_update_for_recreate = False
         self.endpoint_port = 80
         self.deployment_selector = {"app.kubernetes.io/instance": "f2ai-account"}
         self.service_selector = dict(self.deployment_selector)
@@ -177,18 +179,21 @@ class FakeKubectl:
                         )
                     ]
                 )
+            strategy = {"type": self.strategy_type}
+            if (
+                self.strategy_type == "RollingUpdate"
+                or self.include_rolling_update_for_recreate
+            ):
+                strategy["rollingUpdate"] = {
+                    "maxUnavailable": self.max_unavailable,
+                    "maxSurge": self.max_surge,
+                }
             body = {
                 "metadata": {"resourceVersion": deployment_rv, "generation": 9},
                 "spec": {
                     "replicas": self.spec_replicas,
                     "selector": {"matchLabels": self.deployment_selector},
-                    "strategy": {
-                        "type": "RollingUpdate",
-                        "rollingUpdate": {
-                            "maxUnavailable": self.max_unavailable,
-                            "maxSurge": self.max_surge,
-                        },
-                    },
+                    "strategy": strategy,
                     "template": {
                         "metadata": {
                             "annotations": self.deployment_annotations,
@@ -646,6 +651,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
     def test_deployment_safety_contract_fails_closed_before_patch(self):
         cases = [
             ("spec_replicas", 1),
+            ("strategy_type", "OnDelete"),
             ("max_unavailable", 1),
             ("max_surge", 0),
         ]
@@ -656,6 +662,33 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
                 with self.assertRaisesRegex(self.subject.ReconcileError, "deployment contract"):
                     self.run_rollout(fake)
                 self.assertEqual([], fake.patches)
+
+    def test_recreate_strategy_reconciles_runtime_sources(self):
+        value_snapshot = snapshot()
+        fake = FakeKubectl(
+            [value_snapshot, value_snapshot], deployment_annotations={}
+        )
+        fake.strategy_type = "Recreate"
+
+        result = self.run_rollout(fake)
+
+        self.assertTrue(result.changed)
+        self.assertEqual(1, len(fake.patches))
+        self.assertEqual(
+            self.current_annotations(value_snapshot), fake.deployment_annotations
+        )
+
+    def test_recreate_strategy_rejects_rolling_update_fields(self):
+        fake = FakeKubectl([snapshot()], deployment_annotations={})
+        fake.strategy_type = "Recreate"
+        fake.include_rolling_update_for_recreate = True
+
+        with self.assertRaisesRegex(
+            self.subject.ReconcileError, "deployment contract"
+        ):
+            self.run_rollout(fake)
+
+        self.assertEqual([], fake.patches)
 
     def test_one_replica_contract_validates_spec_status_and_one_ready_backend(self):
         if "expected_replicas" not in inspect.signature(self.subject.reconcile).parameters:

@@ -424,12 +424,17 @@ def _int_or_string_equals(value: object, expected: int) -> bool:
 def _validate_deployment_contract(deployment: dict, expected_replicas: int) -> None:
     spec = deployment.get("spec") or {}
     strategy = spec.get("strategy") or {}
-    rolling = strategy.get("rollingUpdate") or {}
-    if (
-        spec.get("replicas") != expected_replicas
-        or strategy.get("type") != "RollingUpdate"
-        or not _int_or_string_equals(rolling.get("maxUnavailable"), 0)
-        or not _int_or_string_equals(rolling.get("maxSurge"), 1)
+    strategy_type = strategy.get("type")
+    rolling = strategy.get("rollingUpdate")
+    rolling_safe = (
+        strategy_type == "RollingUpdate"
+        and isinstance(rolling, dict)
+        and _int_or_string_equals(rolling.get("maxUnavailable"), 0)
+        and _int_or_string_equals(rolling.get("maxSurge"), 1)
+    )
+    recreate_safe = strategy_type == "Recreate" and rolling in (None, {})
+    if spec.get("replicas") != expected_replicas or not (
+        rolling_safe or recreate_safe
     ):
         raise ReconcileError("deployment contract is unsafe")
 
