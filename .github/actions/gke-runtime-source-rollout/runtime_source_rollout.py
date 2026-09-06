@@ -31,6 +31,7 @@ SUPPORTED_KINDS = frozenset({"Secret", "ConfigMap"})
 ANNOTATION_PREFIX = "fosterflow.ai/runtime-source-"
 MAX_CONVERGENCE_ATTEMPTS = 3
 ROLLOUT_TIMEOUT_SECONDS = 600
+ROLLOUT_POLL_SECONDS = 5
 PROXY_START_TIMEOUT_SECONDS = 15
 METADATA_REQUEST_TIMEOUT_SECONDS = 30
 MAX_PARTIAL_METADATA_BYTES = 262_144
@@ -511,20 +512,27 @@ def _patch_annotations(
     )
 
 
-def _wait_rollout(runner: Runner, namespace: str, deployment: str) -> None:
-    _run(
-        runner,
-        [
-            "kubectl",
-            "-n",
-            namespace,
-            "rollout",
-            "status",
-            f"deployment/{deployment}",
-            f"--timeout={ROLLOUT_TIMEOUT_SECONDS}s",
-        ],
-        failure="deployment rollout failed",
-    )
+def _wait_rollout(
+    runner: Runner,
+    namespace: str,
+    deployment: str,
+    expected_replicas: int,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    deadline = monotonic() + ROLLOUT_TIMEOUT_SECONDS
+    while True:
+        current = _read_deployment(runner, namespace, deployment)
+        try:
+            _validate_deployment_status(current, expected_replicas)
+        except ReconcileError as error:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise ReconcileError("deployment rollout failed") from error
+            sleeper(min(ROLLOUT_POLL_SECONDS, remaining))
+            continue
+        return
 
 
 def _validate_service_selector(deployment: dict, service: dict) -> None:
@@ -731,7 +739,7 @@ def _reconcile_validated(
             changed = True
         # The manifest apply may be rolling a new image even when the runtime
         # source fingerprints are already current.
-        _wait_rollout(runner, namespace, deployment)
+        _wait_rollout(runner, namespace, deployment, expected_replicas)
 
         validated_deployment = _validate_runtime(
             runner,

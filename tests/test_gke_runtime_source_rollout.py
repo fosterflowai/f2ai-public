@@ -54,7 +54,6 @@ class FakeKubectl:
         self.deployment_annotations = dict(deployment_annotations or {})
         self.commands: list[list[str]] = []
         self.patches: list[dict] = []
-        self.rollouts = 0
         self._source_reads = 0
         self.fail_source = False
         self.ready_endpoints = 2
@@ -64,6 +63,7 @@ class FakeKubectl:
         self.status_updated_replicas = 2
         self.status_ready_replicas = 2
         self.status_available_replicas = 2
+        self.deployment_status_sequence: list[dict[str, int]] = []
         self.max_unavailable = 0
         self.max_surge = 1
         self.endpoint_port = 80
@@ -154,12 +154,29 @@ class FakeKubectl:
             return subprocess.CompletedProcess(command, 0, f"{uid}\t{rv}", "")
 
         if "get" in command and any(token.startswith("deployment/") for token in command):
+            deployment_read_index = self._deployment_reads
             rv_index = min(
-                self._deployment_reads,
+                deployment_read_index,
                 len(self.deployment_resource_versions) - 1,
             )
             deployment_rv = self.deployment_resource_versions[rv_index]
             self._deployment_reads += 1
+            status = {
+                "observedGeneration": 9,
+                "replicas": self.status_replicas,
+                "updatedReplicas": self.status_updated_replicas,
+                "readyReplicas": self.status_ready_replicas,
+                "availableReplicas": self.status_available_replicas,
+            }
+            if self.deployment_status_sequence:
+                status.update(
+                    self.deployment_status_sequence[
+                        min(
+                            deployment_read_index,
+                            len(self.deployment_status_sequence) - 1,
+                        )
+                    ]
+                )
             body = {
                 "metadata": {"resourceVersion": deployment_rv, "generation": 9},
                 "spec": {
@@ -180,13 +197,7 @@ class FakeKubectl:
                         "spec": self.pod_spec(),
                     },
                 },
-                "status": {
-                    "observedGeneration": 9,
-                    "replicas": self.status_replicas,
-                    "updatedReplicas": self.status_updated_replicas,
-                    "readyReplicas": self.status_ready_replicas,
-                    "availableReplicas": self.status_available_replicas,
-                },
+                "status": status,
             }
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
 
@@ -201,10 +212,6 @@ class FakeKubectl:
                 else:
                     self.deployment_annotations[key] = value
             return subprocess.CompletedProcess(command, 0, "patched", "")
-
-        if "rollout" in command:
-            self.rollouts += 1
-            return subprocess.CompletedProcess(command, 0, "rolled out", "")
 
         if "endpointslice" in command:
             endpoints = [
@@ -433,6 +440,12 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
             arguments["source_reader"] = fake.read_source
         return self.subject.reconcile(**arguments)
 
+    def assert_no_rollout_watch(self, fake):
+        self.assertFalse(
+            any("rollout" in command for command in fake.commands),
+            "the action must not use kubectl rollout status",
+        )
+
     def test_same_source_snapshot_is_idempotent_but_waits_for_image_rollout(self):
         value_snapshot = snapshot()
         fake = FakeKubectl(
@@ -444,7 +457,57 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
 
         self.assertFalse(result.changed)
         self.assertEqual([], fake.patches)
-        self.assertEqual(1, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
+
+    def test_wait_rollout_polls_exact_deployment_status_without_rollout_watch(self):
+        fake = FakeKubectl([snapshot()])
+        fake.deployment_status_sequence = [
+            {
+                "replicas": 3,
+                "updatedReplicas": 2,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+            },
+            {
+                "replicas": 2,
+                "updatedReplicas": 2,
+                "readyReplicas": 2,
+                "availableReplicas": 2,
+            },
+        ]
+        clock = iter((0.0, 1.0, 2.0))
+        sleeps = []
+
+        self.subject._wait_rollout(
+            fake,
+            "app",
+            "f2ai-account",
+            2,
+            monotonic=lambda: next(clock),
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual([5], sleeps)
+        self.assert_no_rollout_watch(fake)
+
+    def test_wait_rollout_fails_at_its_bounded_deadline(self):
+        fake = FakeKubectl([snapshot()])
+        fake.status_ready_replicas = 1
+        clock = iter((0.0, float(self.subject.ROLLOUT_TIMEOUT_SECONDS)))
+
+        with self.assertRaisesRegex(
+            self.subject.ReconcileError, "deployment rollout failed"
+        ):
+            self.subject._wait_rollout(
+                fake,
+                "app",
+                "f2ai-account",
+                2,
+                monotonic=lambda: next(clock),
+                sleeper=lambda _seconds: self.fail("deadline must not sleep"),
+            )
+
+        self.assert_no_rollout_watch(fake)
 
     def test_each_typed_source_change_updates_only_pod_template_annotations(self):
         for changed_ref in snapshot():
@@ -462,7 +525,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
 
                 self.assertTrue(result.changed)
                 self.assertEqual(1, len(fake.patches))
-                self.assertEqual(1, fake.rollouts)
+                self.assert_no_rollout_watch(fake)
                 patch = fake.patches[0]
                 self.assertEqual({"resourceVersion": "deployment-rv"}, patch["metadata"])
                 self.assertEqual(
@@ -499,7 +562,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
         self.assertTrue(result.changed)
         self.assertEqual(2, result.attempts)
         self.assertEqual(2, len(fake.patches))
-        self.assertEqual(2, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
         self.assertEqual(self.current_annotations(second), fake.deployment_annotations)
 
     def test_fourth_snapshot_drift_fails_closed_after_three_attempts(self):
@@ -516,7 +579,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
             self.run_rollout(fake)
 
         self.assertEqual(3, len(fake.patches))
-        self.assertEqual(3, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
 
     def test_check_only_fails_on_drift_without_patch(self):
         value_snapshot = snapshot()
@@ -526,7 +589,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
             self.run_rollout(fake, check_only=True)
 
         self.assertEqual([], fake.patches)
-        self.assertEqual(0, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
 
     def test_sources_must_exactly_cover_all_pod_runtime_refs(self):
         cases = [
@@ -612,14 +675,14 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
         result = self.run_rollout(fake, expected_replicas=1)
 
         self.assertFalse(result.changed)
-        self.assertEqual(1, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
 
     def test_each_status_count_must_equal_expected_replicas(self):
-        for attribute in (
-            "status_replicas",
-            "status_updated_replicas",
-            "status_ready_replicas",
-            "status_available_replicas",
+        for attribute, status_key in (
+            ("status_replicas", "replicas"),
+            ("status_updated_replicas", "updatedReplicas"),
+            ("status_ready_replicas", "readyReplicas"),
+            ("status_available_replicas", "availableReplicas"),
         ):
             with self.subTest(attribute=attribute):
                 value_snapshot = snapshot()
@@ -627,7 +690,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
                     [value_snapshot, value_snapshot],
                     deployment_annotations=self.current_annotations(value_snapshot),
                 )
-                setattr(fake, attribute, 1)
+                fake.deployment_status_sequence = [{}, {}, {status_key: 1}]
 
                 with self.assertRaisesRegex(
                     self.subject.ReconcileError, "fully ready"
@@ -723,7 +786,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
         result = self.run_rollout(fake)
 
         self.assertFalse(result.changed)
-        self.assertEqual(1, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
 
     def test_final_deployment_change_retries_before_success(self):
         value_snapshot = snapshot()
@@ -734,6 +797,8 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
         fake.deployment_resource_versions = [
             "rv-1",
             "rv-1",
+            "rv-1",
+            "rv-concurrent",
             "rv-concurrent",
             "rv-concurrent",
             "rv-concurrent",
@@ -744,7 +809,7 @@ class RuntimeSourceRolloutTest(unittest.TestCase):
 
         self.assertEqual(2, result.attempts)
         self.assertFalse(result.changed)
-        self.assertEqual(2, fake.rollouts)
+        self.assert_no_rollout_watch(fake)
 
     def test_missing_source_fails_without_leaking_command_output(self):
         fake = FakeKubectl([snapshot()])
