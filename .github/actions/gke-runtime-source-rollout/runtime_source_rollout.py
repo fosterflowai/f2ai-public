@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import selectors
 import subprocess
@@ -32,7 +33,10 @@ ANNOTATION_PREFIX = "fosterflow.ai/runtime-source-"
 MAX_CONVERGENCE_ATTEMPTS = 3
 ROLLOUT_TIMEOUT_SECONDS = 600
 ROLLOUT_POLL_SECONDS = 5
-PROXY_START_TIMEOUT_SECONDS = 15
+PROXY_START_TIMEOUT_SECONDS = 60
+PROXY_START_MAX_ATTEMPTS = 3
+PROXY_RETRY_DELAY_SECONDS = 1
+PROXY_OUTPUT_BUFFER_BYTES = 8192
 METADATA_REQUEST_TIMEOUT_SECONDS = 30
 MAX_PARTIAL_METADATA_BYTES = 262_144
 PARTIAL_METADATA_ACCEPT = (
@@ -178,11 +182,34 @@ def _run(
 class _KubectlMetadataProxy:
     """Expose the authenticated API on loopback for strict content negotiation."""
 
-    def __init__(self, popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen):
+    def __init__(self, popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen):
         self._popen = popen
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> str:
+        for attempt in range(1, PROXY_START_MAX_ATTEMPTS + 1):
+            ready = False
+            try:
+                url, reason, exit_code, hint = self._start()
+                if url is not None:
+                    ready = True
+                    return url
+            finally:
+                if not ready:
+                    self._stop()
+            # Only controlled categories and numeric metadata may leave the process.
+            # Redacting arbitrary stderr is unsafe: auth plugins can print credentials.
+            diagnostic = (
+                f"attempt={attempt}/{PROXY_START_MAX_ATTEMPTS} "
+                f"reason={reason} exit_code={exit_code if exit_code is not None else 'unknown'} "
+                f"hint={hint} timeout_seconds={PROXY_START_TIMEOUT_SECONDS}"
+            )
+            print(f"metadata-only API proxy startup failed: {diagnostic}", file=sys.stderr)
+            if attempt < PROXY_START_MAX_ATTEMPTS:
+                time.sleep(PROXY_RETRY_DELAY_SECONDS)
+        raise ReconcileError(f"metadata-only API proxy failed: {diagnostic}") from None
+
+    def _start(self) -> tuple[str | None, str, int | None, str]:
         try:
             process = self._popen(
                 [
@@ -194,39 +221,87 @@ class _KubectlMetadataProxy:
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
+                stderr=subprocess.PIPE,
+                bufsize=0,
             )
-        except OSError as error:
-            raise ReconcileError("metadata-only API proxy failed") from error
+        except OSError:
+            return None, "spawn-error", None, "unclassified"
         self._process = process
-        if process.stdout is None:
-            self._stop()
-            raise ReconcileError("metadata-only API proxy failed")
+        if process.stdout is None or process.stderr is None:
+            return None, "missing-pipe", process.poll(), "unclassified"
 
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + PROXY_START_TIMEOUT_SECONDS
+        hint = "unclassified"
+        buffers = {process.stdout: b"", process.stderr: b""}
+        oversized = {process.stdout: False, process.stderr: False}
+        diagnostic_tail = b""
         try:
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    break
-                events = selector.select(max(0.0, deadline - time.monotonic()))
-                if not events:
-                    break
-                line = process.stdout.readline().strip()
-                match = PROXY_LISTEN.fullmatch(line)
-                if match is None:
-                    continue
-                port = int(match.group("port"))
-                if 1 <= port <= 65535:
-                    return f"http://127.0.0.1:{port}"
-                break
-        finally:
-            selector.close()
-        self._stop()
-        raise ReconcileError("metadata-only API proxy failed")
+            with selectors.DefaultSelector() as selector:
+                for stream in buffers:
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ)
+                while time.monotonic() < deadline:
+                    events = selector.select(max(0.0, deadline - time.monotonic()))
+                    for key, _ in events:
+                        stream = key.fileobj
+                        try:
+                            chunk = os.read(stream.fileno(), PROXY_OUTPUT_BUFFER_BYTES)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(stream)
+                            continue
+                        if stream is process.stderr:
+                            diagnostic_tail = (diagnostic_tail + chunk)[-PROXY_OUTPUT_BUFFER_BYTES:]
+                            hint = self._diagnostic_hint(diagnostic_tail, hint)
+                        # Read bytes, not buffered readline(): a partial line must not
+                        # block the deadline, nor may a buffered second line be missed.
+                        parts = (buffers[stream] + chunk).split(b"\n")
+                        for line in parts[:-1]:
+                            discard = oversized[stream] or len(line) > PROXY_OUTPUT_BUFFER_BYTES
+                            oversized[stream] = False
+                            if discard:
+                                continue
+                            match = PROXY_LISTEN.fullmatch(line.decode("utf-8", errors="replace").rstrip("\r"))
+                            if match is not None and time.monotonic() < deadline and process.poll() is None:
+                                port = int(match.group("port"))
+                                if 1 <= port <= 65535:
+                                    return f"http://127.0.0.1:{port}", "ready", None, hint
+                        tail = parts[-1]
+                        if len(tail) > PROXY_OUTPUT_BUFFER_BYTES:
+                            oversized[stream] = True
+                            tail = b""
+                        buffers[stream] = tail
+                    if not selector.get_map():
+                        try:
+                            code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            return None, "closed-output", None, hint
+                        return None, "exited", code, hint
+                    # Drain both pipes to EOF after an exit so the final error hint
+                    # is captured; EOF descriptors wake select without another wait.
+        except (OSError, ValueError):
+            return None, "read-error", process.poll(), hint
+        return None, "timeout", process.poll(), hint
+
+    @staticmethod
+    def _diagnostic_hint(output: bytes, previous: str) -> str:
+        lowered = output.lower()
+        for marker, category in (
+            (b"gke-gcloud-auth-plugin", "credential-plugin"),
+            (b"getting credentials", "credential-plugin"),
+            (b"address already in use", "address-in-use"),
+            (b"unauthorized", "authentication"),
+            (b"forbidden", "authorization"),
+            (b"no configuration has been provided", "kubeconfig"),
+            (b"context was not found", "kubeconfig"),
+            (b"connection refused", "connection-refused"),
+            (b"i/o timeout", "network-timeout"),
+            (b"no such host", "dns"),
+        ):
+            if marker in lowered:
+                return category
+        return previous
 
     def _stop(self) -> None:
         process = self._process
@@ -244,8 +319,9 @@ class _KubectlMetadataProxy:
         except (OSError, subprocess.SubprocessError):
             pass
         finally:
-            if process.stdout is not None:
-                process.stdout.close()
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self._stop()
